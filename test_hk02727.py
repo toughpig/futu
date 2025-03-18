@@ -129,7 +129,7 @@ def test_market_data(test_stock=TEST_STOCK):
 
 def test_account_info():
     """测试账户信息获取"""
-    logger.info("=== 测试账户信息获取 ===")
+    logger.info("=== 测试账户信息获取 (专注HK市场) ===")
     conn = FutuConnection()
     
     if not conn.connect():
@@ -153,13 +153,33 @@ def test_account_info():
                 for i, acc in accounts.iterrows():
                     acc_id = acc['acc_id'] if 'acc_id' in accounts.columns else '未知'
                     trd_env = acc['trd_env_name'] if 'trd_env_name' in accounts.columns else '未知'
-                    logger.info(f"  账户 {i+1}: ID={acc_id}, 环境={trd_env}")
+                    # 检查是否有市场授权信息
+                    if 'trd_market_auth' in accounts.columns:
+                        auth = acc['trd_market_auth']
+                        markets = []
+                        try:
+                            if isinstance(auth, (list, tuple)):
+                                for market in auth:
+                                    markets.append(str(market))
+                            elif isinstance(auth, int):
+                                # 位掩码处理
+                                for i in range(32):  # 假设最多32个市场
+                                    if auth & (1 << i):
+                                        markets.append(f"Market_{i}")
+                            
+                            market_str = ", ".join(markets) if markets else "无市场信息"
+                            logger.info(f"  账户 {i+1}: ID={acc_id}, 环境={trd_env}, 市场授权={market_str}")
+                        except:
+                            logger.info(f"  账户 {i+1}: ID={acc_id}, 环境={trd_env}, 市场授权=解析失败")
+                    else:
+                        logger.info(f"  账户 {i+1}: ID={acc_id}, 环境={trd_env}")
             else:
                 logger.info(f"  账户列表数据类型: {type(accounts)}")
         else:
             logger.error(f"✗ 获取账户列表失败或没有账户")
             
         # 获取账户资金信息 (无论是否解锁交易都尝试)
+        logger.info("尝试获取HK账户资金信息...")
         account_info = trading.get_account_info()
         if account_info is not None:
             logger.info(f"✓ 成功获取账户资金信息")
@@ -179,7 +199,8 @@ def test_account_info():
                     ('market_val', '市值'),
                     ('avl_withdrawal_cash', '可取资金'),
                     ('max_power_short', '融券限额'),
-                    ('net_cash_power', '净现金购买力')
+                    ('net_cash_power', '净现金购买力'),
+                    ('currency', '货币')
                 ]
                 
                 for field, label in fields:
@@ -196,6 +217,7 @@ def test_account_info():
             logger.error(f"✗ 获取账户资金信息失败")
             
         # 获取持仓信息 (无论是否解锁交易都尝试)
+        logger.info("尝试获取HK账户持仓信息...")
         positions = trading.get_positions()
         if positions is not None:
             logger.info(f"✓ 成功查询持仓")
@@ -252,6 +274,64 @@ def test_account_info():
                 logger.warning(f"  持仓数据结构异常: {type(positions)}")
         else:
             logger.error(f"✗ 获取持仓信息失败")
+            
+        # 获取订单列表
+        logger.info("尝试获取HK账户订单信息...")
+        orders = trading.get_order_list()
+        if orders is not None:
+            logger.info(f"✓ 成功查询订单列表")
+            
+            if isinstance(orders, pd.DataFrame):
+                if orders.empty:
+                    logger.info(f"  账户没有进行中的订单")
+                else:
+                    logger.info(f"  订单数量: {len(orders)}")
+                    # 检查我们需要的关键列是否存在
+                    expected_cols = ['code', 'qty', 'price', 'order_status', 'trd_side', 'order_id', 'create_time']
+                    available_cols = orders.columns.tolist()
+                    
+                    logger.debug(f"  订单数据列: {available_cols}")
+                    
+                    # 输出每个订单的详细信息
+                    for i, order in orders.iterrows():
+                        order_info = []
+                        # 订单ID
+                        order_id = order['order_id'] if 'order_id' in available_cols else '未知'
+                        order_info.append(f"订单ID={order_id}")
+                        
+                        # 代码
+                        code = order['code'] if 'code' in available_cols else '未知'
+                        order_info.append(f"代码={code}")
+                        
+                        # 方向
+                        side = order['trd_side'] if 'trd_side' in available_cols else '未知'
+                        if side == ft.TrdSide.BUY:
+                            side_str = "买入"
+                        elif side == ft.TrdSide.SELL:
+                            side_str = "卖出"
+                        else:
+                            side_str = str(side)
+                        order_info.append(f"方向={side_str}")
+                        
+                        # 状态
+                        status = order['order_status'] if 'order_status' in available_cols else '未知'
+                        order_info.append(f"状态={status}")
+                        
+                        # 价格和数量
+                        price = order['price'] if 'price' in available_cols else '未知'
+                        qty = order['qty'] if 'qty' in available_cols else '未知'
+                        order_info.append(f"价格={price}, 数量={qty}")
+                        
+                        # 创建时间
+                        create_time = order['create_time'] if 'create_time' in available_cols else '未知'
+                        order_info.append(f"创建时间={create_time}")
+                        
+                        # 输出拼接的订单信息
+                        logger.info(f"  订单 {i+1}: {', '.join(order_info)}")
+            else:
+                logger.warning(f"  订单数据结构异常: {type(orders)}")
+        else:
+            logger.error(f"✗ 获取订单列表失败")
             
         conn.close()
         return True

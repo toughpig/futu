@@ -186,12 +186,13 @@ class Trading:
             logger.error(f"Error modifying order: {str(e)}")
             return False
     
-    def get_order_list(self, status_filter=None):
+    def get_order_list(self, status_filter=None, stock_code=None):
         """
         Get list of orders
         
         Args:
             status_filter: Filter by order status or None for all
+            stock_code: Optional stock code to filter orders
         
         Returns:
             pandas.DataFrame with order data or None if error
@@ -201,32 +202,114 @@ class Trading:
             return None
             
         try:
-            logger.debug(f"Getting order list with filter: {status_filter}")
+            logger.debug(f"Getting order list with filter: {status_filter}{', code: '+stock_code if stock_code else ''}")
             # Determine trading environment from config
             trd_env = ft.TrdEnv.REAL if config.TRADING_ENV == 'REAL' else ft.TrdEnv.SIMULATE
+            
+            # 获取账户列表，以便找到正确的acc_id
+            try:
+                ret, accounts = self.conn.trade_ctx.get_acc_list()
+                if ret != ft.RET_OK:
+                    logger.warning(f"Failed to get account list: {accounts}")
+                else:
+                    logger.debug(f"Got {len(accounts)} accounts")
+            except Exception as e:
+                logger.warning(f"Error getting account list: {str(e)}")
+                accounts = None
+                
+            # 尝试找到匹配环境的账户ID
+            acc_id = 0
+            if accounts is not None and isinstance(accounts, pd.DataFrame) and not accounts.empty:
+                # 尝试找到与当前交易环境匹配的账户
+                matching_accounts = accounts[accounts['trd_env'] == trd_env] if 'trd_env' in accounts.columns else pd.DataFrame()
+                if not matching_accounts.empty:
+                    acc_id = matching_accounts['acc_id'].iloc[0]
+                    logger.debug(f"Using matching account ID: {acc_id}")
+                else:
+                    # 使用第一个可用账户
+                    acc_id = accounts['acc_id'].iloc[0]
+                    logger.debug(f"Using first available account ID: {acc_id}")
             
             # Create filter list if status filter is provided
             status_filter_list = [status_filter] if status_filter is not None else []
             
-            # Call order_list_query with proper parameters
-            ret, data = self.conn.trade_ctx.order_list_query(
-                status_filter_list=status_filter_list,
-                trd_env=trd_env
-            )
+            # 尝试不同的参数组合
+            try:
+                # 完整参数调用
+                logger.debug(f"Querying orders with trd_env={trd_env}, acc_id={acc_id}, code={stock_code}")
+                ret, data = self.conn.trade_ctx.order_list_query(
+                    code=stock_code if stock_code else '',
+                    status_filter_list=status_filter_list,
+                    trd_env=trd_env,
+                    acc_id=acc_id
+                )
+            except TypeError as te:
+                # 某些参数可能不受支持，尝试更简单的调用
+                logger.debug(f"Full parameter call not supported: {te}, trying simplified call")
+                try:
+                    # 不带code参数的调用
+                    ret, data = self.conn.trade_ctx.order_list_query(
+                        status_filter_list=status_filter_list,
+                        trd_env=trd_env,
+                        acc_id=acc_id
+                    )
+                except Exception as e2:
+                    # 最基本的调用
+                    logger.debug(f"Simplified call failed: {e2}, using basic call")
+                    ret, data = self.conn.trade_ctx.order_list_query(
+                        status_filter_list=status_filter_list,
+                        trd_env=trd_env
+                    )
             
             if ret != ft.RET_OK:
-                logger.error(f"Failed to get order list: {data}")
+                error_msg = str(data)
+                logger.error(f"Failed to get order list: {error_msg}")
+                
+                # 处理常见错误
+                if "Nonexisting acc_id" in error_msg:
+                    logger.warning(f"账户ID {acc_id} 不存在，请检查账户配置")
+                elif "API not ready" in error_msg or "Network failed" in error_msg:
+                    logger.warning("API连接问题，请检查与OpenD的连接")
+                
                 return None
             
-            logger.debug(f"Got order list with {len(data) if data is not None else 0} orders")    
+            # 添加数据验证和详细的日志记录
+            if data is None:
+                logger.warning("API返回的订单数据为None")
+                return pd.DataFrame()  # 返回空DataFrame而不是None
+                
+            if not isinstance(data, pd.DataFrame):
+                logger.warning(f"API返回的订单数据类型不是DataFrame: {type(data)}")
+                try:
+                    # 尝试转换为DataFrame
+                    if isinstance(data, (list, dict)):
+                        data = pd.DataFrame(data)
+                    else:
+                        logger.error(f"无法将类型 {type(data)} 转换为DataFrame")
+                        return pd.DataFrame()
+                except Exception as conv_err:
+                    logger.error(f"转换订单数据至DataFrame失败: {str(conv_err)}")
+                    return pd.DataFrame()
+            
+            # 检查数据是否为空
+            if data.empty:
+                logger.info("账户没有订单")
+                return data
+                
+            logger.debug(f"Got order list with {len(data)} orders")    
+            logger.debug(f"Order columns: {data.columns.tolist()}")
+            
             return data
         except Exception as e:
             logger.error(f"Error getting order list: {str(e)}")
             return None
     
-    def get_positions(self):
+    def get_positions(self, stock_code=None):
         """
         Get current positions
+        
+        Args:
+            stock_code: Optional stock code to filter positions
         
         Returns:
             pandas.DataFrame with position data or None if error
@@ -236,16 +319,61 @@ class Trading:
             return None
             
         try:
-            logger.debug("Getting positions")
+            logger.debug(f"Getting positions{' for '+stock_code if stock_code else ''}")
             # Determine trading environment from config
             trd_env = ft.TrdEnv.REAL if config.TRADING_ENV == 'REAL' else ft.TrdEnv.SIMULATE
             
-            # 根据Futu API文档调用position_list_query，添加详细参数
-            logger.debug(f"Querying positions with trd_env={trd_env}")
-            ret, data = self.conn.trade_ctx.position_list_query(
-                trd_env=trd_env,
-                refresh_cache=True  # 刷新缓存获取最新数据
-            )
+            # 获取账户列表，以便找到正确的acc_id
+            try:
+                ret, accounts = self.conn.trade_ctx.get_acc_list()
+                if ret != ft.RET_OK:
+                    logger.warning(f"Failed to get account list: {accounts}")
+                else:
+                    logger.debug(f"Got {len(accounts)} accounts")
+            except Exception as e:
+                logger.warning(f"Error getting account list: {str(e)}")
+                accounts = None
+                
+            # 尝试找到匹配环境的账户ID
+            acc_id = 0
+            if accounts is not None and isinstance(accounts, pd.DataFrame) and not accounts.empty:
+                # 尝试找到与当前交易环境匹配的账户
+                matching_accounts = accounts[accounts['trd_env'] == trd_env] if 'trd_env' in accounts.columns else pd.DataFrame()
+                if not matching_accounts.empty:
+                    acc_id = matching_accounts['acc_id'].iloc[0]
+                    logger.debug(f"Using matching account ID: {acc_id}")
+                else:
+                    # 使用第一个可用账户
+                    acc_id = accounts['acc_id'].iloc[0]
+                    logger.debug(f"Using first available account ID: {acc_id}")
+            
+            # 根据API文档设置参数
+            try:
+                # 完整参数调用
+                logger.debug(f"Querying positions with trd_env={trd_env}, acc_id={acc_id}, code={stock_code}")
+                ret, data = self.conn.trade_ctx.position_list_query(
+                    code=stock_code if stock_code else '',  # 过滤特定股票代码
+                    position_market=ft.TrdMarket.HK,  # 指定香港市场
+                    trd_env=trd_env,  # 交易环境
+                    acc_id=acc_id,  # 账户ID
+                    refresh_cache=True  # 刷新缓存获取最新数据
+                )
+            except TypeError as te:
+                # 某些参数可能不受支持，尝试更简单的调用
+                logger.debug(f"Full parameter call not supported: {te}, trying simplified call")
+                try:
+                    # 简化参数但仍包含关键参数
+                    ret, data = self.conn.trade_ctx.position_list_query(
+                        code=stock_code if stock_code else '',
+                        trd_env=trd_env,
+                        acc_id=acc_id
+                    )
+                except Exception as e2:
+                    # 最基本的调用
+                    logger.debug(f"Simplified call failed: {e2}, using basic call")
+                    ret, data = self.conn.trade_ctx.position_list_query(
+                        trd_env=trd_env
+                    )
             
             if ret != ft.RET_OK:
                 error_msg = str(data)
@@ -256,6 +384,8 @@ class Trading:
                     logger.warning("市场未开盘，无法获取持仓数据")
                 elif "API not ready" in error_msg or "Network failed" in error_msg:
                     logger.warning("API连接问题，请检查与OpenD的连接")
+                elif "Nonexisting acc_id" in error_msg:
+                    logger.warning(f"账户ID {acc_id} 不存在，请检查账户配置")
                 
                 return None
             
@@ -321,16 +451,80 @@ class Trading:
             # Determine trading environment from config
             trd_env = ft.TrdEnv.REAL if config.TRADING_ENV == 'REAL' else ft.TrdEnv.SIMULATE
             
-            ret, data = self.conn.trade_ctx.accinfo_query(
-                trd_env=trd_env
-            )
+            # 获取账户列表，以便找到正确的acc_id
+            try:
+                ret, accounts = self.conn.trade_ctx.get_acc_list()
+                if ret != ft.RET_OK:
+                    logger.warning(f"Failed to get account list: {accounts}")
+                else:
+                    logger.debug(f"Got {len(accounts)} accounts")
+            except Exception as e:
+                logger.warning(f"Error getting account list: {str(e)}")
+                accounts = None
+                
+            # 尝试找到匹配环境的账户ID
+            acc_id = 0
+            if accounts is not None and isinstance(accounts, pd.DataFrame) and not accounts.empty:
+                # 尝试找到与当前交易环境匹配的账户
+                matching_accounts = accounts[accounts['trd_env'] == trd_env] if 'trd_env' in accounts.columns else pd.DataFrame()
+                if not matching_accounts.empty:
+                    acc_id = matching_accounts['acc_id'].iloc[0]
+                    logger.debug(f"Using matching account ID: {acc_id}")
+                else:
+                    # 使用第一个可用账户
+                    acc_id = accounts['acc_id'].iloc[0]
+                    logger.debug(f"Using first available account ID: {acc_id}")
+            
+            # 尝试不同的参数组合
+            try:
+                # 完整参数调用
+                logger.debug(f"Querying account info with trd_env={trd_env}, acc_id={acc_id}")
+                ret, data = self.conn.trade_ctx.accinfo_query(
+                    trd_env=trd_env,
+                    acc_id=acc_id
+                )
+            except Exception as e:
+                # 最基本的调用
+                logger.debug(f"Full parameter call not supported: {e}, using basic call")
+                ret, data = self.conn.trade_ctx.accinfo_query(
+                    trd_env=trd_env
+                )
             
             if ret != ft.RET_OK:
-                logger.error(f"Failed to get account info: {data}")
+                error_msg = str(data)
+                logger.error(f"Failed to get account info: {error_msg}")
+                
+                # 处理常见错误
+                if "Nonexisting acc_id" in error_msg:
+                    logger.warning(f"账户ID {acc_id} 不存在，请检查账户配置")
+                elif "API not ready" in error_msg or "Network failed" in error_msg:
+                    logger.warning("API连接问题，请检查与OpenD的连接")
+                    
                 return None
             
             # Log the entire response for debugging
             logger.debug(f"Got account info: {data}")    
+            
+            # 数据验证和处理
+            if data is None:
+                logger.warning("API返回的账户信息为None")
+                return pd.DataFrame()
+                
+            if not isinstance(data, pd.DataFrame):
+                logger.warning(f"API返回的账户信息类型不是DataFrame: {type(data)}")
+                try:
+                    if isinstance(data, (list, dict)):
+                        data = pd.DataFrame(data)
+                    else:
+                        logger.error(f"无法将类型 {type(data)} 转换为DataFrame")
+                        return pd.DataFrame()
+                except Exception as conv_err:
+                    logger.error(f"转换账户信息至DataFrame失败: {str(conv_err)}")
+                    return pd.DataFrame()
+            
+            if data.empty:
+                logger.warning("账户信息为空")
+                return data
             
             if data is not None and len(data) > 0:
                 # Use get() with a default to avoid KeyError if the key doesn't exist
@@ -365,4 +559,59 @@ class Trading:
             return data
         except Exception as e:
             logger.error(f"Error getting account list: {str(e)}")
+            return None
+
+    def _get_hk_account_id(self, trd_env):
+        """
+        获取HK账户的ID
+        
+        Args:
+            trd_env: 交易环境
+            
+        Returns:
+            HK账户ID或None
+        """
+        try:
+            ret, acc_list = self.conn.trade_ctx.get_acc_list()
+            if ret != ft.RET_OK:
+                logger.error(f"Failed to get account list: {acc_list}")
+                return None
+                
+            logger.debug(f"Account list: {acc_list}")
+            
+            if not isinstance(acc_list, pd.DataFrame) or acc_list.empty:
+                logger.warning("Account list is empty or not a DataFrame")
+                return None
+                
+            # 首先尝试使用交易环境和账户ID确定有效账户
+            # 在测试结果中我们看到账户ID可能因为选错了而不存在
+            # 所以我们先验证账户列表中存在哪些账户ID
+            valid_acc_ids = set(acc_list['acc_id'].tolist())
+            logger.debug(f"Valid account IDs: {valid_acc_ids}")
+            
+            # 检查是否有账户类型或市场信息列
+            if 'trd_env' in acc_list.columns and 'trd_market_auth' in acc_list.columns:
+                # 查找具有HK市场权限且环境匹配的账户
+                for _, acc in acc_list.iterrows():
+                    if acc['trd_env'] == trd_env:
+                        trd_market_auth = acc['trd_market_auth']
+                        
+                        # 检查市场授权的数据类型和结构
+                        if isinstance(trd_market_auth, (list, tuple)) and ft.TrdMarket.HK in trd_market_auth:
+                            return acc['acc_id']
+                        elif isinstance(trd_market_auth, int) and trd_market_auth & (1 << ft.TrdMarket.HK.value):
+                            return acc['acc_id']
+                        
+            # 备选方案1：直接使用账户ID列表中的第一个账户
+            # 在生产环境中这可能不是理想选择，但在测试环境中可以接受
+            if len(valid_acc_ids) > 0:
+                first_acc_id = acc_list['acc_id'].iloc[0]
+                logger.info(f"使用第一个可用账户ID: {first_acc_id}")
+                return first_acc_id
+            
+            # 如果上面的方法都失败了，返回None表示未找到合适的账户
+            logger.warning("未找到任何有效的账户ID")
+            return None
+        except Exception as e:
+            logger.error(f"Error finding HK account: {str(e)}")
             return None 
